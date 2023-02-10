@@ -1,0 +1,6 @@
+*.py
+*.exe
+*.pdb
+*.rdbg
+*-ubyte
+gz/
