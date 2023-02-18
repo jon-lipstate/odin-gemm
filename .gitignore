@@ -4,3 +4,4 @@
 *.rdbg
 *-ubyte
 gz/
+.vscode/
