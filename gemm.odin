@@ -1,13 +1,35 @@
 package gemm
 import "core:mem"
+import "core:prof/spall"
 import "core:simd"
 import "core:testing"
 
+spall_ctx: spall.Context
+spall_buffer: spall.Buffer
+ENABLE_SPALL :: #config(ENABLE_SPALL, false)
+freq: u64 = 3_500_000_000 // Assumed Processor Speed - 3.5 ghz
+when ENABLE_SPALL {
+	TRACE :: spall.SCOPED_EVENT
+} else {
+	TRACE :: proc(ctx: ^spall.Context, buf: ^spall.Buffer, name: string) {}
+}
+
 main :: proc() {
+	when ENABLE_SPALL {
+		spall_ctx = spall.context_create("mmult.spall")
+		defer spall.context_destroy(&spall_ctx)
+		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
+		spall_buffer = spall.buffer_create(buffer_backing)
+		defer spall.buffer_destroy(&spall_ctx, &spall_buffer)
+		//freq, _ = time.tsc_frequency() // <-- VERY slow call
+		fmt.println("SPALL WORKING")
+	}
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	perf_test(nil)
 }
 // Naive Implementation
 mmult_jpi :: proc(A: ^Matrix, B: ^Matrix, C: ^Matrix) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	k := int(A.n_rows)
 	m := int(A.n_cols)
 	n := int(B.n_cols)
@@ -31,7 +53,7 @@ Matrix_Slice :: struct {
 	base:   [^]f64,
 	stride: int,
 }
-submatrix :: proc(mat: ^Matrix, r, c: int) -> Matrix {
+submatrix :: proc "contextless" (mat: ^Matrix, r, c: int) -> Matrix {
 	m := Matrix{}
 	// m.offset = mat.offset + {r, c}
 	m.n_rows = mat.n_rows
@@ -45,17 +67,17 @@ get :: proc {
 	mget,
 	sget,
 }
-pget :: #force_inline proc(ptr: [^]f64, cstride, r, c: int) -> ^f64 {
+pget :: #force_inline proc "contextless" (ptr: [^]f64, cstride, r, c: int) -> ^f64 #no_bounds_check {
 	result := &ptr[c * cstride + r]
 	return result
 }
-mget :: #force_inline proc(mat: ^Matrix, r, c: int) -> ^f64 {
+mget :: #force_inline proc "contextless" (mat: ^Matrix, r, c: int) -> ^f64 #no_bounds_check {
 	// i is rows
 	// j is cols
 	result := &mat.base[c * mat.n_cols + r]
 	return result
 }
-sget :: #force_inline proc(s: ^Matrix_Slice, r, c: int) -> ^f64 {
+sget :: #force_inline proc "contextless" (s: ^Matrix_Slice, r, c: int) -> ^f64 #no_bounds_check {
 	result := &s.base[c * s.stride + r]
 	return result
 }
@@ -83,14 +105,14 @@ set_random :: proc(mat: ^Matrix) #no_bounds_check {
 		}
 	}
 }
-set_ones :: proc(mat: ^Matrix) #no_bounds_check {
+set_ones :: proc "contextless" (mat: ^Matrix) #no_bounds_check {
 	for i: int = 0; i < mat.n_rows; i += 1 {
 		for j: int = 0; j < mat.n_cols; j += 1 {
 			mget(mat, i, j)^ = 1
 		}
 	}
 }
-set_n :: proc(mat: ^Matrix) #no_bounds_check {
+set_n :: proc "contextless" (mat: ^Matrix) #no_bounds_check {
 	n: f64 = 1
 	for i: int = 0; i < mat.n_rows; i += 1 {
 		for j: int = 0; j < mat.n_cols; j += 1 {
@@ -100,14 +122,17 @@ set_n :: proc(mat: ^Matrix) #no_bounds_check {
 	}
 }
 make_matrix :: proc(mat: ^Matrix, m, n: int, allocator := context.allocator) {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	context.allocator = allocator
 	n_elm := int(m) * int(n)
-	mat.base = cast([^]f64)mem.alloc(n_elm * size_of(f64))
+	buf, ok := mem.alloc(n_elm * size_of(f64))
+	mat.base = cast([^]f64)buf
 	mat.n_rows = m
 	mat.n_cols = n
 }
 
 microkernel_4x4_packed :: proc(k: int, mp_a, mp_b: [^]f64, c: ^Matrix_Slice) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	gamma_0123_c0 := load_4x64(get(c, 0, 0))
 	gamma_0123_c1 := load_4x64(get(c, 0, 1))
 	gamma_0123_c2 := load_4x64(get(c, 0, 2))
@@ -135,13 +160,17 @@ microkernel_4x4_packed :: proc(k: int, mp_a, mp_b: [^]f64, c: ^Matrix_Slice) #no
 	store_4x64(get(c, 0, 3), gamma_0123_c3)
 }
 
-load_4x64 :: #force_inline proc(src: [^]f64) -> simd.f64x4 {
+load_4x64 :: #force_inline proc(src: [^]f64) -> simd.f64x4 #no_bounds_check {
+	//TRACE(&spall_ctx, &spall_buffer, #procedure)
 	return simd.f64x4{src[0], src[1], src[2], src[3]}
+	//return simd.from_slice(#simd[4]f64, src[:3]) // this has same perf as above
 }
-broadcast_4x64 :: #force_inline proc(v: f64) -> simd.f64x4 {
+broadcast_4x64 :: #force_inline proc(v: f64) -> simd.f64x4 #no_bounds_check {
+	//TRACE(&spall_ctx, &spall_buffer, #procedure)
 	return simd.f64x4{v, v, v, v}
 }
-store_4x64 :: #force_inline proc(dst: [^]f64, mmx: simd.f64x4) {
+store_4x64 :: #force_inline proc(dst: [^]f64, mmx: simd.f64x4) #no_bounds_check {
+	//TRACE(&spall_ctx, &spall_buffer, #procedure)
 	dst[0] = simd.extract(mmx, 0)
 	dst[1] = simd.extract(mmx, 1)
 	dst[2] = simd.extract(mmx, 2)
@@ -149,6 +178,7 @@ store_4x64 :: #force_inline proc(dst: [^]f64, mmx: simd.f64x4) {
 }
 
 mmult :: proc(A: ^Matrix, B: ^Matrix, C: ^Matrix, allocator := context.allocator) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	m := A.n_rows
 	n := B.n_cols
 	k := A.n_cols
@@ -165,11 +195,13 @@ mmult :: proc(A: ^Matrix, B: ^Matrix, C: ^Matrix, allocator := context.allocator
 	// Micro-Tile C_ij_ji in mmx registers
 	bytes_a := k_c * m_c * size_of(f64)
 	bytes_b := k_c * n_c * size_of(f64)
-	a_pack := cast([^]f64)mem.alloc(bytes_a)
-	b_pack := cast([^]f64)mem.alloc(bytes_b)
+	buf_a, _ := mem.alloc(bytes_a)
+	buf_b, _ := mem.alloc(bytes_b)
+	a_pack := cast([^]f64)buf_a
+	b_pack := cast([^]f64)buf_b
 	defer mem.free(a_pack)
 	defer mem.free(b_pack)
-	fmt.println("A&B Cache-Packing Temp Allocs (kb):", bytes_a / 1024, bytes_b / 1024)
+	// fmt.println("A&B Cache-Packing Temp Allocs (kb):", bytes_a / 1024, bytes_b / 1024)
 
 	for j_iter := 0; j_iter < n; j_iter += n_c {
 		// Loop 5: Slice B & C into Column-Panels C_j & B_j (width n_c)
@@ -197,6 +229,7 @@ mmult :: proc(A: ^Matrix, B: ^Matrix, C: ^Matrix, allocator := context.allocator
 }
 
 gemm_ij_kernel :: proc(m, n, k: int, a_tilde, b_tilde: [^]f64, c_ij: ^Matrix_Slice) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	n_r :: 4
 	m_r :: 4
 	for j_iter := 0; j_iter < n; j_iter += n_r {
@@ -215,6 +248,7 @@ gemm_ij_kernel :: proc(m, n, k: int, a_tilde, b_tilde: [^]f64, c_ij: ^Matrix_Sli
 }
 
 pack_by_cols :: proc(dst: [^]f64, src: ^Matrix_Slice, n, k: int) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	//K:Rows - N:Cols
 	n_r :: 4
 	// Pack a KC x NC panel of B.  NC is assumed to be a multiple of NR.  The block is 
@@ -247,6 +281,7 @@ pack_by_cols :: proc(dst: [^]f64, src: ^Matrix_Slice, n, k: int) #no_bounds_chec
 	}
 }
 pack_by_rows :: proc(dst: [^]f64, src: ^Matrix_Slice, m, k: int) #no_bounds_check {
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	//K:cols - N:rows
 	m_r :: 4
 	// Pack a MC x KC block of A.  MC is assumed to be a multiple of MR.  The block is 
@@ -267,11 +302,21 @@ pack_by_rows :: proc(dst: [^]f64, src: ^Matrix_Slice, m, k: int) #no_bounds_chec
 	}
 }
 
-import "core:math/rand"
-import "core:intrinsics"
 import "core:fmt"
+import "core:intrinsics"
+import "core:math/rand"
 @(test)
 perf_test :: proc(t: ^testing.T) {
+	when ENABLE_SPALL {
+		spall_ctx = spall.context_create("regex.spall")
+		defer spall.context_destroy(&spall_ctx)
+		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
+		spall_buffer = spall.buffer_create(buffer_backing)
+		defer spall.buffer_destroy(&spall_ctx, &spall_buffer)
+		//freq, _ = time.tsc_frequency() // <-- VERY slow call
+		fmt.println("SPALL WORKING")
+	}
+	TRACE(&spall_ctx, &spall_buffer, #procedure)
 	fmt.println("AMD 3950X: L1: 1mb, L2: 8mb, L3:64mb (shared), GFLOPS/Core: 225, Clock: 3.5 gHz (4.7 Turbo)")
 	fmt.println("Expected Performance: ~90% Max, 200 GFLOP")
 	//
